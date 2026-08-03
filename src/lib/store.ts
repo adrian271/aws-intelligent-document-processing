@@ -8,7 +8,7 @@
  */
 
 import { GetCommand, PutCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { ddb, TABLE } from "./aws";
+import { ddb, table } from "./aws";
 import type { DocumentRecord } from "./types";
 
 /** Every item shares this partition key so the GSI acts as one sorted list. */
@@ -28,19 +28,19 @@ function fromStored(item: Record<string, unknown>): DocumentRecord {
 }
 
 export async function putDocument(doc: DocumentRecord): Promise<DocumentRecord> {
-  await ddb.send(new PutCommand({ TableName: TABLE, Item: toStored(doc) }));
+  await ddb.send(new PutCommand({ TableName: table(), Item: toStored(doc) }));
   return doc;
 }
 
 export async function getDocument(id: string): Promise<DocumentRecord | null> {
-  const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { id } }));
+  const res = await ddb.send(new GetCommand({ TableName: table(), Key: { id } }));
   return res.Item ? fromStored(res.Item) : null;
 }
 
 export async function listDocuments(limit = 50): Promise<DocumentRecord[]> {
   const res = await ddb.send(
     new QueryCommand({
-      TableName: TABLE,
+      TableName: table(),
       IndexName: "byCreatedAt",
       KeyConditionExpression: "gsi1pk = :pk",
       ExpressionAttributeValues: { ":pk": LIST_PK },
@@ -74,7 +74,7 @@ export async function updateDocument(
 
   const res = await ddb.send(
     new UpdateCommand({
-      TableName: TABLE,
+      TableName: table(),
       Key: { id },
       UpdateExpression: `SET ${sets.join(", ")}`,
       ExpressionAttributeNames: names,

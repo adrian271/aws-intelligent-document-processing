@@ -32,10 +32,22 @@ export async function processDocument(doc: DocumentRecord): Promise<DocumentReco
     const llm = await extractFields(formatForPrompt(ocr));
     const type = getDocType(llm.docType);
 
+    // Ground against everything Textract saw, not just flat reading order.
+    // On a multi-column page, reading order interleaves the columns, so a
+    // value the model correctly read from a right-hand block is not
+    // contiguous in `ocr.text` and would be wrongly rejected. Textract's
+    // key/value pairs and table cells preserve the grouping that reading
+    // order destroys, so include them in the corpus.
+    const groundingCorpus = [
+      ocr.text,
+      ...ocr.keyValues.map((kv) => `${kv.key} ${kv.value}`),
+      ...ocr.tables.flatMap((t) => [t.headers.join(" "), ...t.rows.map((r) => r.join(" "))]),
+    ].join("\n");
+
     // --- 3 & 4. Ground each value, then fuse confidences -------------------
     const fields: ExtractedField[] = type.fields.map((def) => {
       const raw = llm.fields.find((f) => f.key === def.key);
-      const grounded = isGrounded(raw?.sourceText ?? null, ocr.text);
+      const grounded = isGrounded(raw?.sourceText ?? null, groundingCorpus);
       const ocrConfidence = matchOcrConfidence(raw?.sourceText ?? null, ocr.keyValues);
 
       const { confidence, source } = fuseConfidence({
@@ -113,12 +125,33 @@ function matchOcrConfidence(
   const needle = normalise(sourceText);
   if (!needle) return null;
 
-  const hit = keyValues.find((kv) => {
-    const haystack = normalise(`${kv.key}${kv.value}`);
-    return haystack.includes(needle) || needle.includes(normalise(kv.value));
-  });
+  // Match against the most *specific* pair rather than the first one that
+  // happens to overlap. Two traps here, both of which silently poison every
+  // field if you get them wrong:
+  //
+  //  - An empty candidate must be skipped. `"anything".includes("")` is true,
+  //    so a form field Textract detected but couldn't read a value for would
+  //    otherwise match every field on the page and hand its (low) confidence
+  //    to all of them.
+  //  - Longest match wins. Short values like a currency code appear inside
+  //    many longer strings, so first-match would attach the wrong confidence.
+  let best: KeyValue | null = null;
+  let bestLength = 0;
 
-  return hit ? hit.confidence : null;
+  for (const kv of keyValues) {
+    const value = normalise(kv.value);
+    if (value.length === 0) continue;
+
+    const pair = normalise(`${kv.key}${kv.value}`);
+    if (!pair.includes(needle) && !needle.includes(value)) continue;
+
+    if (value.length > bestLength) {
+      best = kv;
+      bestLength = value.length;
+    }
+  }
+
+  return best ? best.confidence : null;
 }
 
 /**

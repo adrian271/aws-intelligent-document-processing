@@ -15,8 +15,16 @@ import { AnthropicBedrockMantle } from "@anthropic-ai/bedrock-sdk";
 
 export const REGION = process.env.AWS_REGION ?? "us-east-1";
 
-export const BUCKET = requireEnv("IDP_BUCKET");
-export const TABLE = requireEnv("IDP_TABLE");
+/**
+ * Resolved lazily, on purpose.
+ *
+ * Reading these at module scope would throw while the route module is still
+ * being imported — before any handler's try/catch exists — and the framework
+ * would serve an HTML error page instead of our JSON. Calling them inside a
+ * handler keeps a missing variable on the same path as every other failure.
+ */
+export const bucket = () => requireEnv("IDP_BUCKET");
+export const table = () => requireEnv("IDP_TABLE");
 
 /**
  * Bedrock model id. Bedrock prefixes Anthropic model ids with `anthropic.`.
@@ -32,7 +40,8 @@ function requireEnv(name: string): string {
   if (!value) {
     throw new Error(
       `Missing required environment variable ${name}. ` +
-        `Run infra/bootstrap.sh and copy its output into .env.local.`,
+        `Run ./infra/bootstrap.sh, copy the block it prints into .env.local, ` +
+        `then restart the dev server (Next only reads .env.local at startup).`,
     );
   }
   return value;

@@ -15,7 +15,7 @@
  */
 
 import { AnalyzeDocumentCommand, type Block } from "@aws-sdk/client-textract";
-import { textract, BUCKET } from "./aws";
+import { textract, bucket } from "./aws";
 
 export interface KeyValue {
   key: string;
@@ -42,7 +42,7 @@ export async function analyzeDocument(s3Key: string): Promise<OcrResult> {
   try {
     res = await textract.send(
       new AnalyzeDocumentCommand({
-        Document: { S3Object: { Bucket: BUCKET, Name: s3Key } },
+        Document: { S3Object: { Bucket: bucket(), Name: s3Key } },
         // FORMS gives key/value pairs, TABLES gives grids. Each feature is
         // billed separately, so only ask for what the schema actually needs.
         FeatureTypes: ["FORMS", "TABLES"],

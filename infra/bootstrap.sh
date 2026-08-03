@@ -19,12 +19,28 @@ echo "==> Checking credentials"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 echo "    account $ACCOUNT_ID, region $REGION"
 
+# Everything here must agree on one region: Textract can only read an S3 object
+# in its own region, so a mismatch fails at OCR time with a confusing
+# InvalidS3ObjectException. Warn loudly rather than silently disagreeing with
+# the region the CLI is otherwise configured to use.
+CLI_REGION="$(aws configure get region 2>/dev/null || true)"
+if [ -n "$CLI_REGION" ] && [ "$CLI_REGION" != "$REGION" ]; then
+  echo
+  echo "    NOTE: your AWS CLI default region is '$CLI_REGION', but this script"
+  echo "    is using '$REGION'. That is fine — the app reads AWS_REGION from"
+  echo "    .env.local, not your CLI config — but any manual 'aws' command you"
+  echo "    run against these resources needs an explicit --region $REGION."
+  echo "    To build everything in $CLI_REGION instead, re-run:"
+  echo "        ./infra/bootstrap.sh $CLI_REGION"
+  echo
+fi
+
 # Bucket names are globally unique, so scope it with the account id.
 BUCKET="${IDP_BUCKET:-idp-documents-${ACCOUNT_ID}-${REGION}}"
 
 # --- S3 ---------------------------------------------------------------------
 echo "==> S3 bucket: $BUCKET"
-if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+if aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
   echo "    already exists"
 else
   if [ "$REGION" = "us-east-1" ]; then
@@ -64,7 +80,7 @@ aws s3api put-bucket-encryption --bucket "$BUCKET" \
 # Uploaded documents are disposable in a POC; expire them so the free tier
 # storage allowance never fills up.
 echo "    setting 30-day expiry on uploads/"
-aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" \
+aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null \
   --lifecycle-configuration '{
     "Rules": [{
       "ID": "expire-poc-uploads",
@@ -103,16 +119,31 @@ else
 fi
 
 # --- Bedrock preflight ------------------------------------------------------
+#
+# Listing the model catalogue proves nothing: every account can see every model
+# AWS offers. What matters is whether *this* account has accepted the model's
+# end-user agreement, which is what agreementAvailability reports.
 echo "==> Bedrock model access"
-if aws bedrock list-foundation-models --region "$REGION" \
-     --query "modelSummaries[?contains(modelId, 'anthropic')].modelId" \
-     --output text 2>/dev/null | grep -q anthropic; then
-  echo "    Anthropic models visible in $REGION"
-else
-  echo "    WARNING: could not list Anthropic models in $REGION."
-  echo "    Enable model access in the Bedrock console:"
-  echo "    https://console.aws.amazon.com/bedrock/home?region=$REGION#/modelaccess"
-fi
+MODEL="${BEDROCK_MODEL_ID:-anthropic.claude-opus-5}"
+AGREEMENT="$(aws bedrock get-foundation-model-availability \
+  --model-id "$MODEL" --region "$REGION" \
+  --query 'agreementAvailability.status' --output text 2>/dev/null || echo UNKNOWN)"
+
+case "$AGREEMENT" in
+  AVAILABLE)
+    echo "    access granted for $MODEL in $REGION"
+    ;;
+  NOT_AVAILABLE)
+    echo "    BLOCKED: $MODEL is visible in $REGION but access is NOT enabled."
+    echo "    This is a one-time click-through — accept the model agreement at:"
+    echo "      https://console.aws.amazon.com/bedrock/home?region=$REGION#/modelaccess"
+    echo "    OCR will work without it; the extraction step will return 403."
+    ;;
+  *)
+    echo "    Could not determine access for $MODEL (got '$AGREEMENT')."
+    echo "    Check manually: https://console.aws.amazon.com/bedrock/home?region=$REGION#/modelaccess"
+    ;;
+esac
 
 # --- Output -----------------------------------------------------------------
 cat <<EOF

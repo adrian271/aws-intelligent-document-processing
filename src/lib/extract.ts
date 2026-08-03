@@ -14,9 +14,13 @@
  *     read each value from, and we check that text actually appears in the OCR
  *     output. A value the model invented cannot survive that check — this is
  *     the concrete defence against hallucinated fields.
+ *
+ * The model call itself lives in providers.ts, so this file is the same
+ * regardless of which Bedrock model is doing the work.
  */
 
-import { bedrock, MODEL_ID } from "./aws";
+import { MODEL_ID } from "./aws";
+import { generateStructured } from "./providers";
 import { DOC_TYPES, type DocTypeDef } from "./schemas";
 import type { LlmExtraction } from "./types";
 
@@ -24,13 +28,16 @@ import type { LlmExtraction } from "./types";
  * Build the response schema from the doc-type config. Because the schema is
  * generated, adding a field in schemas.ts automatically teaches the model
  * about it — the two can't drift apart.
+ *
+ * The schema is deliberately plain: objects, arrays, strings, numbers and
+ * enums only. `anyOf`/nullable types are supported by some Bedrock models and
+ * silently mishandled by others, so absence is represented as an empty string
+ * and normalised back to null in code.
  */
-function buildResponseSchema() {
+function buildResponseSchema(): Record<string, unknown> {
   const allFieldKeys = Array.from(
     new Set(DOC_TYPES.flatMap((t) => t.fields.map((f) => f.key))),
   );
-
-  const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
 
   return {
     type: "object",
@@ -53,7 +60,7 @@ function buildResponseSchema() {
       fields: {
         type: "array",
         description:
-          "One entry per field you were asked for. Include every requested field, using a null value if it is genuinely absent from the document.",
+          "One entry per field you were asked for. Include every requested field, using an empty string if it is genuinely absent from the document.",
         items: {
           type: "object",
           additionalProperties: false,
@@ -61,9 +68,9 @@ function buildResponseSchema() {
           properties: {
             key: { type: "string", enum: allFieldKeys },
             value: {
-              ...nullableString,
+              type: "string",
               description:
-                "The normalised value. Dates as YYYY-MM-DD. Money as digits and a decimal point only, no currency symbols or thousands separators.",
+                "The normalised value, or an empty string if absent. Dates as YYYY-MM-DD. Money as digits and a decimal point only, no currency symbols or thousands separators.",
             },
             confidence: {
               type: "number",
@@ -71,9 +78,9 @@ function buildResponseSchema() {
                 "0 to 1. Your confidence that this is the correct value for this field. Be honest — a low score routes the field to a human, which is the desired outcome when you are unsure.",
             },
             sourceText: {
-              ...nullableString,
+              type: "string",
               description:
-                "The exact substring of the document text you read this value from, copied verbatim. Null only if the value was inferred rather than read.",
+                "The exact substring of the document text you read this value from, copied verbatim. Empty string only if the value was inferred rather than read.",
             },
           },
         },
@@ -115,43 +122,86 @@ Do two things:
 
 ${typeCatalogue}
 
-2. Extract the fields listed for the type you chose. Return an entry for every field of that type — use a null value for fields genuinely not present on the document. Do not return fields belonging to other document types.
+2. Extract the fields listed for the type you chose. Return an entry for every field of that type — use an empty string for fields genuinely not present on the document. Do not return fields belonging to other document types.
 
 Rules:
-- Copy the exact substring you read each value from into sourceText. Do not paraphrase it, reformat it, or reconstruct it from memory. If you cannot point at the text, set sourceText to null and lower your confidence.
-- Never guess a value to fill a gap. A null with an honest explanation is more useful to us than a plausible invention, because a human reviews every low-confidence field anyway.
+- Copy the exact substring you read each value from into sourceText. Do not paraphrase it, reformat it, or reconstruct it from memory. If you cannot point at the text, leave sourceText empty and lower your confidence.
+- Never guess a value to fill a gap. An empty value with an honest confidence is more useful to us than a plausible invention, because a human reviews every low-confidence field anyway.
 - The OCR may contain errors. If a value looks garbled, extract what is there and lower the confidence rather than silently correcting it.
 - Normalise dates to YYYY-MM-DD and money to plain digits with a decimal point.
 
 ${ocrText}`;
 }
 
+/** Treat blank strings as absent — see the schema note above. */
+const orNull = (s: unknown): string | null => {
+  if (typeof s !== "string") return null;
+  const trimmed = s.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
 export async function extractFields(ocrText: string): Promise<LlmExtraction> {
-  const response = await bedrock.messages.create({
-    model: MODEL_ID,
-    max_tokens: 8000,
-    // Extraction is a well-scoped task with the answer sitting in the context,
-    // so low effort is both cheaper and faster with no measurable accuracy
-    // cost here. Raise this if you add reasoning-heavy validation rules.
-    output_config: {
-      effort: "low",
-      format: { type: "json_schema", schema: buildResponseSchema() },
-    },
-    messages: [{ role: "user", content: buildPrompt(ocrText) }],
-  });
+  const raw = (await generateStructured(
+    buildPrompt(ocrText),
+    buildResponseSchema(),
+  ).catch((err) => {
+    throw explainBedrockError(err);
+  })) as Partial<LlmExtraction>;
 
-  // Safety classifiers can decline a request; that arrives as a 200 with an
-  // empty content array, so check before indexing into it.
-  if (response.stop_reason === "refusal") {
-    throw new Error("The model declined to process this document.");
+  // Normalise defensively: a schema constrains shape, but a model can still
+  // return a number where we expect a string, or omit an optional array.
+  return {
+    docType: typeof raw.docType === "string" ? raw.docType : "unknown",
+    docTypeConfidence: clamp01(raw.docTypeConfidence),
+    docTypeReasoning: orNull(raw.docTypeReasoning) ?? "",
+    fields: (Array.isArray(raw.fields) ? raw.fields : []).map((f) => ({
+      key: String(f?.key ?? ""),
+      value: orNull(f?.value),
+      confidence: clamp01(f?.confidence),
+      sourceText: orNull(f?.sourceText),
+    })),
+    tables: (Array.isArray(raw.tables) ? raw.tables : []).map((t) => ({
+      name: String(t?.name ?? ""),
+      headers: (t?.headers ?? []).map(String),
+      rows: (t?.rows ?? []).map((r) => (Array.isArray(r) ? r.map(String) : [])),
+    })),
+  };
+}
+
+function clamp01(n: unknown): number {
+  const v = typeof n === "number" ? n : Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * Bedrock reports "you haven't done the paperwork" as a generic 403 with a
+ * JSON body, which lands in the review UI as an unreadable blob. Anthropic
+ * models additionally require a one-time use-case form that no amount of
+ * IAM policy will substitute for, so name that explicitly.
+ */
+function explainBedrockError(err: unknown): Error {
+  const raw = err instanceof Error ? err.message : String(err);
+
+  if (/not available for this account|permission_error|AccessDenied|403/.test(raw)) {
+    return new Error(
+      `Bedrock denied access to ${MODEL_ID}. For Anthropic models this is ` +
+        `almost always the one-time use-case form rather than an IAM problem: ` +
+        `Bedrock console → Model access → Modify model access → select an ` +
+        `Anthropic model → Submit use case details. Check with ` +
+        `"aws bedrock get-use-case-for-model-access --region <region>". ` +
+        `To use a different model instead, set BEDROCK_MODEL_ID in .env.local ` +
+        `(e.g. amazon.nova-pro-v1:0) and restart.`,
+    );
   }
 
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("Model returned no text content.");
+  if (/could not be found|ResourceNotFound|ValidationException|404/.test(raw)) {
+    return new Error(
+      `Bedrock rejected the model id "${MODEL_ID}" in this region: ${raw.slice(0, 200)}`,
+    );
   }
 
-  return JSON.parse(textBlock.text) as LlmExtraction;
+  return err instanceof Error ? err : new Error(raw);
 }
 
 /**

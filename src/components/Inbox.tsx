@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { fetchJson } from "@/lib/fetchJson";
 import type { DocumentRecord } from "@/lib/types";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -23,15 +24,11 @@ export function Inbox() {
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch("/api/documents");
-      const data = await res.json();
-      if (!res.ok) {
-        // The API classifies AWS failures (expired credentials, missing
-        // table, Bedrock access) into actionable messages — show them rather
-        // than sending the reader to the server logs.
-        throw new Error(data.error ?? "Could not load documents.");
-      }
-      setDocuments((data as { documents: DocumentRecord[] }).documents);
+      // The API classifies AWS failures (expired credentials, missing table,
+      // Bedrock access) into actionable messages — show them rather than
+      // sending the reader to the server logs.
+      const data = await fetchJson<{ documents: DocumentRecord[] }>("/api/documents");
+      setDocuments(data.documents);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -55,7 +52,10 @@ export function Inbox() {
       setBusy(`Uploading ${file.name}…`);
 
       try {
-        const registerRes = await fetch("/api/documents", {
+        const { document, uploadUrl } = await fetchJson<{
+          document: DocumentRecord;
+          uploadUrl: string;
+        }>("/api/documents", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -64,16 +64,6 @@ export function Inbox() {
             sizeBytes: file.size,
           }),
         });
-
-        if (!registerRes.ok) {
-          const { error: message } = await registerRes.json();
-          throw new Error(message ?? "Failed to register document");
-        }
-
-        const { document, uploadUrl } = (await registerRes.json()) as {
-          document: DocumentRecord;
-          uploadUrl: string;
-        };
 
         const putRes = await fetch(uploadUrl, {
           method: "PUT",
@@ -89,13 +79,7 @@ export function Inbox() {
         setBusy(`Extracting ${file.name}… (OCR + model, ~10-30s)`);
         await refresh();
 
-        const processRes = await fetch(`/api/documents/${document.id}/process`, {
-          method: "POST",
-        });
-        if (!processRes.ok) {
-          const { error: message } = await processRes.json();
-          throw new Error(message ?? "Processing failed");
-        }
+        await fetchJson(`/api/documents/${document.id}/process`, { method: "POST" });
 
         await refresh();
       } catch (err) {

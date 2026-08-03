@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { s3, BUCKET } from "@/lib/aws";
+import { s3, bucket } from "@/lib/aws";
 import { listDocuments, putDocument } from "@/lib/store";
 import { toErrorResponse } from "@/lib/errors";
 import type { DocumentRecord } from "@/lib/types";
@@ -88,7 +88,7 @@ export async function POST(request: Request) {
 
     const uploadUrl = await getSignedUrl(
       s3,
-      new PutObjectCommand({ Bucket: BUCKET, Key: s3Key, ContentType: contentType }),
+      new PutObjectCommand({ Bucket: bucket(), Key: s3Key, ContentType: contentType }),
       { expiresIn: 300 },
     );
 

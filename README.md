@@ -34,6 +34,7 @@ need review — are in the code rather than hidden behind a managed service.
 | `src/lib/schemas.ts` | config | Document types and their fields. **Start here** — everything else is generated from it. |
 | `src/lib/textract.ts` | OCR | Walking Textract's block *graph* into text, key/value pairs and tables. |
 | `src/lib/extract.ts` | classify + extract | Building a JSON Schema from the config, and the grounding check. |
+| `src/lib/providers.ts` | model call | The only file that knows which model is running. Swap models with one env var. |
 | `src/lib/pipeline.ts` | orchestration | Confidence fusion — the ~20 lines that decide what a human sees. |
 | `src/lib/validate.ts` | rules | Turning "low confidence" and "doesn't add up" into an exception queue. |
 | `src/components/ReviewScreen.tsx` | human loop | Corrections, audit trail, approve/reject gating. |
@@ -74,10 +75,57 @@ human time you spend.
 
 - Node 20+
 - AWS CLI, authenticated (`aws sts get-caller-identity` should succeed)
-- **Bedrock model access enabled** for Anthropic models in your region —
-  this is a one-time click-through in the
-  [Bedrock console](https://console.aws.amazon.com/bedrock/home#/modelaccess).
-  It is the single most common reason a first run fails.
+- **Bedrock model access enabled** — see below. This is the single most common
+  reason a first run fails, and it fails *late*: OCR succeeds, then the
+  extraction step returns 403.
+
+#### Enabling Bedrock model access
+
+Serverless foundation models now auto-enable on first invocation, so there is
+usually no toggle to flip. **Anthropic models are the exception**: first-time
+users must submit a short *use case details* form before any invocation
+succeeds. Until that's done, calls fail with
+`403 permission_error: … is not available for this account`.
+
+Being able to *see* a model in the catalogue proves nothing — every account
+sees every model. These two commands are the real diagnostics:
+
+```bash
+# 1. Has the Anthropic use-case form been submitted?
+aws bedrock get-use-case-for-model-access --region us-east-1
+#    ResourceNotFoundException "You have not filled out the request form" = this is your blocker
+
+# 2. Is the model actually usable?
+aws bedrock get-foundation-model-availability \
+  --model-id anthropic.claude-opus-5 --region us-east-1 \
+  --query 'agreementAvailability.status' --output text
+#    AVAILABLE = good | NOT_AVAILABLE = blocked
+```
+
+`bootstrap.sh` runs check 2 and reports it.
+
+To submit the form, go to **Bedrock console → Model access** for your region
+and look for **Submit use case details** (not the per-model toggles):
+
+```
+https://console.aws.amazon.com/bedrock/home?region=us-east-1#/modelaccess
+```
+
+It asks for company name, website, industry, and a sentence on intended use.
+There is a CLI equivalent (`put-use-case-for-model-access --form-data`), but
+the payload is an opaque blob the console generates — use the console.
+
+Access is **per region**. To see pricing before committing, run
+`aws bedrock list-foundation-model-agreement-offers --model-id <model>
+--region <region>` — it prints the full rate card.
+
+#### Keep every service in one region
+
+Textract can only read an S3 object in **its own region**. If your AWS CLI
+default region differs from the region in `.env.local`, resources end up split
+and OCR fails with a misleading `InvalidS3ObjectException` about object
+permissions. `bootstrap.sh` warns when it detects this. Any manual `aws`
+command against these resources needs an explicit `--region`.
 
 ### Setup
 
@@ -93,6 +141,19 @@ First run takes ~10–30 seconds: OCR, then a model call.
 
 `bootstrap.sh` is safe to re-run and only creates what's missing.
 
+> `.env.local` is read **once, at dev-server startup**. If you create or edit it
+> while `npm run dev` is running, restart the server or nothing will change.
+
+### Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| `Missing required environment variable IDP_TABLE` | No `.env.local`, or it was created after the dev server started. Run `./infra/bootstrap.sh`, paste the output, restart. |
+| `AWS credentials are missing or expired` | Re-authenticate (`aws sso login`), then reload the page. |
+| `403 permission_error … not available for this account` | The Anthropic use-case form hasn't been submitted. Run `aws bedrock get-use-case-for-model-access --region <region>` to confirm, then submit it in the console. |
+| S3 rejects the upload (CORS) | The bucket allows `http://localhost:3000` only. Re-run `bootstrap.sh`, or add your origin to the CORS rule. |
+| Textract rejects the file | Multi-page PDF. The sync API is single-page — see "Known limits". |
+
 ### IAM permissions
 
 Whatever principal you're running as needs:
@@ -104,6 +165,30 @@ dynamodb:GetItem, PutItem,
 textract:AnalyzeDocument
 bedrock:InvokeModel                     on the Anthropic model
 ```
+
+### Choosing a model
+
+`BEDROCK_MODEL_ID` selects both the model *and* the API used to reach it —
+`providers.ts` dispatches on the id, and nothing else in the codebase changes:
+
+| Id prefix | API | Structured output via |
+| --- | --- | --- |
+| `anthropic.*` | Messages API (Mantle) | `output_config.format` — native |
+| anything else | Converse | a single forced tool call |
+
+Anthropic models need the one-time use-case form above. **Amazon Nova needs
+no form**, so it is the quickest way to see the pipeline work:
+
+```bash
+BEDROCK_MODEL_ID=amazon.nova-pro-v1:0     # verified working end-to-end
+```
+
+Switching back is one line in `.env.local` plus a dev-server restart.
+
+Note the Converse path is the lowest common denominator: forcing a tool call
+gets you the same schema guarantee, but it is a workaround where Anthropic's
+structured outputs are a first-class feature. Both paths are exercised by the
+same pipeline code.
 
 ---
 
@@ -219,9 +304,15 @@ ends. More setup, but genuinely $0 indefinitely at this volume.
 
 - `npm run typecheck` — clean
 - `npm run build` — clean, all routes correctly dynamic
-- Dev server boots; UI renders; API surfaces AWS failures as actionable
-  messages (verified against a live expired-credential error)
+- Dev server boots; UI renders; API surfaces failures as actionable JSON
+  messages — verified against a live expired-credential error, a
+  missing-`.env.local` run, and a live Bedrock 403
+- **Upload → S3 → Textract verified end-to-end against live AWS.** A real
+  invoice PDF was registered, uploaded via presigned PUT, and OCR'd
+  successfully (~6s). Extraction is the one stage still unverified: it is
+  blocked on Bedrock model access, not on code.
 
-The pipeline has **not** been run end-to-end against live Textract and Bedrock —
-the AWS session in this environment was expired, so that first real document is
-yours to run.
+The extraction stage has **not** been exercised against a live model — the
+account's Anthropic use-case form was still unsubmitted, so every Bedrock call
+returned 403. Everything upstream of it is confirmed working against real AWS.
+Once model access is granted, the first real document is yours to run.

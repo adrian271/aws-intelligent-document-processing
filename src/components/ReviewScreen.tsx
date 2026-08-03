@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { ConfidenceBar } from "./ConfidenceBar";
+import { fetchJson } from "@/lib/fetchJson";
 import type { DocumentRecord } from "@/lib/types";
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -32,13 +33,14 @@ export function ReviewScreen({
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/documents/${doc.id}`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Request failed");
+      const data = await fetchJson<{ document: DocumentRecord }>(
+        `/api/documents/${doc.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+      );
       setDoc(data.document);
       setEdits({});
       router.refresh();
@@ -53,9 +55,10 @@ export function ReviewScreen({
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/documents/${doc.id}/process`, { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Processing failed");
+      const data = await fetchJson<{ document: DocumentRecord }>(
+        `/api/documents/${doc.id}/process`,
+        { method: "POST" },
+      );
       setDoc(data.document);
       router.refresh();
     } catch (err) {
