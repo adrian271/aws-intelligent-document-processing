@@ -144,6 +144,21 @@ First run takes ~10–30 seconds: OCR, then a model call.
 > `.env.local` is read **once, at dev-server startup**. If you create or edit it
 > while `npm run dev` is running, restart the server or nothing will change.
 
+### Tearing it down
+
+```bash
+./infra/teardown.sh               # deletes the S3 bucket + DynamoDB table
+```
+
+It surveys first, prints what it found, and makes you type the account id
+before deleting anything. Both deletions are irreversible.
+
+Nothing this POC creates has a standing charge — DynamoDB is `PAY_PER_REQUEST`
+and the bucket holds a handful of test files — so teardown is housekeeping, not
+cost control. Two things it deliberately leaves alone: Bedrock model agreements
+(account-level, billed per token rather than per subscription, so holding one is
+free) and Textract, which creates no resources at all.
+
 ### Troubleshooting
 
 | Symptom | Cause |
